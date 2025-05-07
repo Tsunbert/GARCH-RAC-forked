@@ -160,7 +160,6 @@ find_best_arch_model <- function(x,
 #' 
 #' 
 #' 
-?Weighted.Box.test
 
 check_autocorrelation <- function(garch_fit, lags = c(1,2,3,4,5)) {
   std_residuals <- residuals(garch_fit, standardize = TRUE)
