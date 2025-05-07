@@ -156,54 +156,165 @@ find_best_arch_model <- function(x,
 #' @export
 #'
 #' @examples
-do_single_garch <- function(x, 
-                            type_model, 
-                            type_dist, 
-                            lag_ar, 
-                            lag_ma, 
-                            lag_arch, 
+#' 
+#' 
+#' 
+#' 
+?Weighted.Box.test
+
+check_autocorrelation <- function(garch_fit, lags = c(1,2,3,4,5)) {
+  std_residuals <- residuals(garch_fit, standardize = TRUE)
+  #alocare de spatii in stiva pentru valori teste
+  p_values_std <- numeric(length(lags))
+  p_values_squared <- numeric(length(lags))
+  for (i in seq_along(lags)) {
+    lag <- lags[i]
+    p_values_std[i] <- Weighted.Box.test(std_residuals,lag = lag, type = "Ljung-Box", sqrd.res = F)$p.value # reziduuri standardizate/SR
+    p_values_squared[i] <- Weighted.Box.test(std_residuals,lag = lag, type = "Ljung-Box", sqrd.res = T)$p.value # reziduuri patratice/SSR pt efecte non-linaire/heteroschedastice
+  }
+  # Ipoteza H0 -> reziduurile necorelate
+  # Verificare
+  if (all(p_values_std > .10) & all(p_values_squared > .10)) {
+    return(TRUE)
+  } else {
+    return(FALSE)
+  }
+}
+  
+check_arch_lm <- function(garch_fit, lags = c(2,3,4,5,6)){
+  std_residuals<-residuals(garch_fit, standardize = TRUE)
+  p_values<-numeric(length(lags))
+  for (i in seq_along(lags)) {
+    lag <- lags[i]
+    p_values[i] <- Weighted.LM.test(std_residuals, h.t = sigma(garch_fit)^2, lag = lag, fitdf = 1)
+  }
+  if (all(p_values > .10)) {
+    return(TRUE)
+  } else {
+    return(FALSE)
+  }
+  
+}
+
+
+do_single_garch <- function(x,
+                            type_model,
+                            type_dist,
+                            lag_ar,
+                            lag_ma,
+                            lag_arch,
                             lag_garch) {
   require(rugarch)
+  require(WeightedPortTest)
   
-  
-  spec = ugarchspec(variance.model = list(model =  type_model, 
-                                          garchOrder = c(lag_arch, lag_garch)),
-                    mean.model = list(armaOrder = c(lag_ar, lag_ma)),
-                    distribution = type_dist)
-  
-  message('Estimating ARMA(',lag_ar, ',', lag_ma,')-',
-          type_model, '(', lag_arch, ',', lag_garch, ')', 
-          ' dist = ', type_dist,
-          appendLF = FALSE)
-  
-  try({
-    my_rugarch <- list()
-    my_rugarch <- ugarchfit(spec = spec, data = x)
-  })
-  
-  if (!is.null(coef(my_rugarch))) {
-    message('\tDone')
-    
-    AIC <- rugarch::infocriteria(my_rugarch)[1]
-    BIC <- rugarch::infocriteria(my_rugarch)[2]
+  # --- Define Spec ---
+  #Switch for family-GARCH submodels
+  if (type_model %in% c('TGARCH','NGARCH','AVGARCH','NAGARCH', 'ALLGARCH')) {
+    spec <- ugarchspec(variance.model = list(model =  'fGARCH',
+                                             garchOrder = c(lag_arch, lag_garch), submodel = type_model),
+                       mean.model = list(armaOrder = c(lag_ar, lag_ma), include.mean = TRUE),
+                       distribution = type_dist)
   } else {
-    message('\tEstimation failed..')
-    
-    AIC <- NA
-    BIC <- NA
+    spec <- ugarchspec(variance.model = list(model =  type_model,
+                                             garchOrder = c(lag_arch, lag_garch), submodel = F),
+                       mean.model = list(armaOrder = c(lag_ar, lag_ma), include.mean = TRUE),
+                       distribution = type_dist)
   }
-
-  est_tab <- tibble(lag_ar, 
+  
+  # --- Message --- (No change here)
+  message('Estimating ARMA(',lag_ar, ',', lag_ma,')-',
+          type_model, '(', lag_arch, ',', lag_garch, ')',
+          ' dist = ', type_dist, appendLF = F)
+  
+  # --- Fit Model ---
+  my_rugarch <- NULL # Initialize as NULL
+  try({
+    my_rugarch <- ugarchfit(spec = spec, data = x, solver = "hybrid")
+  }, silent = TRUE) # Keep it silent if you prefer
+  
+  # --- Initialize AIC/BIC ---
+  AIC <- NA
+  BIC <- NA
+  
+  # --- Check Estimation Success and Parameter Validity ---
+  valid_fit <- FALSE # Flag to track if we should proceed to diagnostics
+  if (is.null(my_rugarch) || inherits(my_rugarch, "try-error") || !inherits(my_rugarch, "uGARCHfit")) {
+    message('\tEstimation failed or invalid object returned..')
+  } else if (length(coef(my_rugarch)) == 0) {
+    message('\tEstimation succeeded but no coefficients found..')
+  } else {
+    # --- Calculate p-values ---
+    # Use the matrix directly for robustness, fallback to tval if needed
+    if (!is.null(my_rugarch@fit$matcoef) && ncol(my_rugarch@fit$matcoef) >= 4) {
+      p_values <- my_rugarch@fit$matcoef[, 4]
+    } else {
+      # Fallback if matcoef structure is unexpected (less likely)
+      # Note: tval might also be missing if Hessian failed severely
+      if(!is.null(my_rugarch@fit$tval)){
+        p_values <- 2 * (1 - pnorm(abs(my_rugarch@fit$tval)))
+      } else {
+        p_values <- NA # Assign NA if tval is also missing
+      }
+    }
+    
+    
+    # --- Detect NA p-values (Hessian issue) *** ---
+    if (any(is.na(p_values))) {
+      message('\tHessian inversion likely failed (NA p-values detected)...')
+      # AIC/BIC remain NA, valid_fit remains FALSE
+    } else {
+      # --- Original Check: Parameter Significance ---
+      if (all(p_values < .10)) {
+        # Parameters are significant, set flag to proceed
+        valid_fit <- TRUE
+      } else {
+        message('\tNon-significant parameters...')
+        # AIC/BIC remain NA, valid_fit remains FALSE
+      }
+    }
+  }
+  
+  # --- Run Diagnostics ONLY if the fit was valid and parameters significant ---
+  if (valid_fit) {
+    if (check_autocorrelation(my_rugarch)) {
+      if (check_arch_lm(my_rugarch)) {
+        # Use try for nyblom as it can sometimes fail too
+        nyblom_res <- try(nyblom(my_rugarch), silent=TRUE)
+        if (!inherits(nyblom_res, "try-error") &&
+            nyblom_res$JointStat < nyblom_res$JointCritical[1]) { # Using 10% critical value
+          
+          message('\tDone!')
+          # Calculate AIC/BIC only if ALL checks pass
+          inf_criteria <- infocriteria(my_rugarch) # Specific function to extract info criteria, comes with the package rugarch
+          AIC <- inf_criteria[1]
+          BIC <- inf_criteria[2]
+          
+        } else {
+          message('\tNyblom stability test failed or errored...')
+          # AIC/BIC remain NA
+        }
+      } else {
+        message('\tARCH effects detected...')
+        # AIC/BIC remain NA
+      }
+    } else {
+      message('\tAutocorrelation detected...')
+      # AIC/BIC remain NA
+    }
+  } # End of valid_fit check block
+  
+  # --- Create Output Table --- 
+  est_tab <- tibble(lag_ar,
                     lag_ma,
                     lag_arch,
                     lag_garch,
                     AIC =  AIC,
                     BIC = BIC,
                     type_model = type_model,
-                    type_dist,
+                    type_dist = type_dist,
                     model_name = paste0('ARMA(', lag_ar, ',', lag_ma, ')+',
                                         type_model, '(', lag_arch, ',', lag_garch, ') ',
-                                        type_dist) ) 
+                                        type_dist) ) # Print configuration of the model
   
   return(est_tab)
 }
